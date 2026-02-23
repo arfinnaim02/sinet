@@ -215,59 +215,89 @@
 
               <div class="rounded-2xl bg-black/20 border border-white/10 p-4 sm:p-5 shadow-sm">
 
-                <!-- Loyalty (Monthly) -->
-              {% if loyalty.enabled %}
-                <div class="p-4 rounded-2xl bg-black/20 border border-white/10 mb-4">
-                  <div class="flex items-start justify-between gap-3">
-                    <div class="text-xs uppercase tracking-wider text-beige/70">
-                      {% trans "Loyalty reward" %}
-                    </div>
-                    <div class="text-[11px] text-beige/60">
-                      {{ loyalty.month }}
-                    </div>
-                  </div>
-
-                  {% if loyalty.earned %}
-                    <div class="mt-2 text-sm text-white font-semibold">
-                      {% blocktrans with p=loyalty.percent %}You unlocked {{ p }}% OFF this month!{% endblocktrans %}
-                    </div>
-                    <div class="mt-2 text-[11px] text-beige/75">
-                      {% trans "Use this coupon on your next order:" %}
+              <!-- Loyalty (Monthly) -->
+                {% if loyalty.enabled %}
+                  {# ✅ Logged-in users (loyalty info shown normally) #}
+                  <div class="p-4 rounded-2xl bg-black/20 border border-white/10 mb-4">
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="text-xs uppercase tracking-wider text-beige/70">
+                        {% trans "Loyalty reward" %}
+                      </div>
+                      <div class="text-[11px] text-beige/60">
+                        {{ loyalty.month }}
+                      </div>
                     </div>
 
-                    <div class="mt-2 flex items-center justify-between gap-3">
-                      <div class="px-3 py-2 rounded-xl bg-white/10 border border-white/10 text-white font-semibold text-sm">
-                        <span id="loyaltyCouponCode">{{ loyalty.coupon_code }}</span>
+                    {% if loyalty.earned %}
+                      <div class="mt-2 text-sm text-white font-semibold">
+                        {% blocktrans with p=loyalty.percent %}You unlocked {{ p }}% OFF this month!{% endblocktrans %}
+                      </div>
+                      <div class="mt-2 text-[11px] text-beige/75">
+                        {% trans "Use this coupon on your next order:" %}
                       </div>
 
-                      {# This only helps user fill the existing coupon input (no backend changes) #}
-                      <button type="button"
-                              id="useLoyaltyCouponBtn"
-                              class="btn-gold px-4 py-2 rounded-xl font-semibold text-dark text-xs">
-                        {% trans "Use it" %}
-                      </button>
+                      <div class="mt-2 flex items-center justify-between gap-3">
+                        <div class="px-3 py-2 rounded-xl bg-white/10 border border-white/10 text-white font-semibold text-sm">
+                          <span id="loyaltyCouponCode">{{ loyalty.coupon_code }}</span>
+                        </div>
+
+                        <button type="button"
+                                id="useLoyaltyCouponBtn"
+                                class="btn-gold px-4 py-2 rounded-xl font-semibold text-dark text-xs">
+                          {% trans "Use it" %}
+                        </button>
+                      </div>
+
+                      <div class="mt-2 text-[11px] text-beige/70">
+                        {% trans "Valid until end of this month. One-time use." %}
+                      </div>
+                    {% else %}
+                      <div class="mt-2 text-sm text-white font-semibold">
+                        {% blocktrans with p=loyalty.percent %}Complete {{ loyalty.target }} delivered orders this month to get {{ p }}% OFF{% endblocktrans %}
+                      </div>
+
+                      <div class="mt-2 text-[11px] text-beige/75">
+                        {% blocktrans with c=loyalty.count t=loyalty.target %}Progress: {{ c }}/{{ t }} delivered orders{% endblocktrans %}
+                      </div>
+
+                      <div class="mt-2 text-[11px] text-beige/70">
+                        {% if loyalty.remaining > 0 %}
+                          {% blocktrans with r=loyalty.remaining %}Order {{ r }} more delivered order(s) to unlock the reward.{% endblocktrans %}
+                        {% endif %}
+                      </div>
+                    {% endif %}
+                  </div>
+
+                {% elif not request.user.is_authenticated %}
+                  {# ✅ Not logged in (show CTA instead of empty space) #}
+                  <div class="p-4 rounded-2xl bg-black/20 border border-white/10 mb-4">
+                    <div class="text-xs uppercase tracking-wider text-beige/70">
+                      {% trans "Loyalty bonus" %}
                     </div>
 
-                    <div class="mt-2 text-[11px] text-beige/70">
-                      {% trans "Valid until end of this month. One-time use." %}
-                    </div>
-                  {% else %}
                     <div class="mt-2 text-sm text-white font-semibold">
-                      {% blocktrans with p=loyalty.percent %}Complete {{ loyalty.target }} delivered orders this month to get {{ p }}% OFF{% endblocktrans %}
+                      {% trans "Register to get Loyalty Bonus & Get Discount!" %}
                     </div>
 
-                    <div class="mt-2 text-[11px] text-beige/75">
-                      {% blocktrans with c=loyalty.count t=loyalty.target %}Progress: {{ c }}/{{ t }} delivered orders{% endblocktrans %}
+                    <div class="mt-2 text-[11px] text-beige/75 leading-relaxed">
+                      {% trans "Log in to track delivered orders and unlock monthly rewards automatically." %}
                     </div>
 
-                    <div class="mt-2 text-[11px] text-beige/70">
-                      {% if loyalty.remaining > 0 %}
-                        {% blocktrans with r=loyalty.remaining %}Order {{ r }} more delivered order(s) to unlock the reward.{% endblocktrans %}
-                      {% endif %}
+                    <div class="mt-3 flex flex-col sm:flex-row gap-2">
+                      {# 🔧 IMPORTANT: set these URLs to your real customer login/register pages #}
+                      <a href="{{ settings.LOGIN_URL }}?next={{ request.get_full_path|urlencode }}"
+                        class="btn-gold px-4 py-2 rounded-xl font-semibold text-dark text-center">
+                        {% trans "Log in" %}
+                      </a>
+
+                      <a href="/accounts/signup/?next={{ request.get_full_path|urlencode }}"
+                        class="px-4 py-2 rounded-xl font-semibold text-white text-center
+                                bg-white/10 border border-white/10 hover:bg-white/15">
+                        {% trans "Register" %}
+                      </a>
                     </div>
-                  {% endif %}
-                </div>
-              {% endif %}
+                  </div>
+                {% endif %}
 
                 <!-- Coupon -->
                 <div class="p-4 rounded-2xl bg-black/20 border border-white/10 mb-4">
