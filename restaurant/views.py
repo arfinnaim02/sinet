@@ -26,7 +26,7 @@ import json
 from decimal import Decimal
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
+from .utils import haversine_km, delivery_fee_for_distance
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import login, logout
@@ -38,8 +38,10 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.csrf import ensure_csrf_cookie, csrf_exempt
 from django.db.models.deletion import ProtectedError
 import re
+from .models import DeliveryPricing
 
 from .models import Review
 from .forms import ReviewForm
@@ -52,37 +54,53 @@ from .forms import (
     ReservationForm,
     DeliveryCouponForm,
     HeroBannerForm,
+    AddonGroupForm,
+    AddonOptionForm,
+    MenuItemAddonGroupForm,
 )
-
 from .models import (
     Category,
     DeliveryCoupon,
     DeliveryOrder,
     DeliveryOrderItem,
+    DeliveryOrderItemAddon,
     DeliveryPromotion,
     MenuItem,
     Reservation,
     ReservationItem,
-    HeroBanner,  # ← ADD THIS
+    HeroBanner,
+    AddonGroup,
+    AddonOption,
+    MenuItemAddonGroup,
+    TelegramLog,
 )
-
-
 from django.db.models import Avg, Count
 from django.core.paginator import Paginator
+from django.core.mail import send_mail
 
-from .utils import haversine_km, delivery_fee_for_distance
+from .telegram_utils import (
+    answer_callback_query,
+    build_delivery_order_message,
+    build_delivery_status_keyboard,
+    delivery_status_label,
+    edit_telegram_message_text,
+    send_telegram_message_full,
+    telegram_user_is_allowed,
+)
 
 from django.utils.translation import gettext as _
 
-from django.views.decorators.http import require_POST
+
 
 from django.core.cache import cache
 from django.shortcuts import redirect
+
 # -------------------------
 # Public pages
 # -------------------------
 
 
+@ensure_csrf_cookie
 def home(request: HttpRequest) -> HttpResponse:
     popular_items = (
         MenuItem.objects.filter(status=MenuItem.STATUS_ACTIVE)
@@ -106,6 +124,7 @@ def home(request: HttpRequest) -> HttpResponse:
     )
 
 
+@ensure_csrf_cookie
 def menu(request: HttpRequest) -> HttpResponse:
     """Display the menu (category + search only)."""
     categories = Category.objects.filter(is_active=True).order_by("order", "name")
@@ -113,8 +132,10 @@ def menu(request: HttpRequest) -> HttpResponse:
     category_slug = (request.GET.get("category") or "").strip()
     q = (request.GET.get("q") or "").strip()
 
-    items = MenuItem.objects.select_related("category").exclude(
-        status=MenuItem.STATUS_HIDDEN
+    items = (
+        MenuItem.objects.select_related("category")
+        .prefetch_related("addon_group_links")
+        .exclude(status=MenuItem.STATUS_HIDDEN)
     )
 
     current_category: Category | None = None
@@ -135,6 +156,7 @@ def menu(request: HttpRequest) -> HttpResponse:
 
     most_ordered = (
         MenuItem.objects.select_related("category")
+        .prefetch_related("addon_group_links")
         .exclude(status=MenuItem.STATUS_HIDDEN)
         .filter(tags__icontains="popular")
         .order_by("-created_at")[:3]
@@ -194,8 +216,11 @@ def contact(request: HttpRequest) -> HttpResponse:
 
 
 def menu_item_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    """Partial template for menu modal."""
-    item = get_object_or_404(MenuItem.objects.select_related("category"), pk=pk)
+    """Partial template for menu/reservation modal."""
+    item = get_object_or_404(
+        MenuItem.objects.select_related("category"),
+        pk=pk,
+    )
     if item.status == MenuItem.STATUS_HIDDEN:
         return HttpResponse(status=404)
 
@@ -203,12 +228,53 @@ def menu_item_detail(request: HttpRequest, pk: int) -> HttpResponse:
     if ctx not in {"menu", "reservation", "delivery"}:
         ctx = "menu"
 
-    # ✅ Use a reservation-specific partial so preview updates reservation pre-order (not delivery cart)
     template = "partials/menu_item_modal.html"
     if ctx == "reservation":
         template = "partials/reservation_item_modal.html"
 
-    return render(request, template, {"item": item, "ctx": ctx})
+    addon_links = []
+    if ctx in {"menu", "delivery"}:
+        addon_links = (
+            MenuItemAddonGroup.objects.filter(
+                menu_item=item,
+                addon_group__is_active=True,
+            )
+            .select_related("addon_group")
+            .prefetch_related("addon_group__options")
+            .order_by("order", "id")
+        )
+
+    prepared_addon_groups = []
+    for link in addon_links:
+        group = link.addon_group
+        options = [opt for opt in group.options.all() if opt.is_active]
+
+        prepared_addon_groups.append(
+            {
+                "link_id": link.id,
+                "group_id": group.id,
+                "group_name": group.name,
+                "group_slug": group.slug,
+                "selection_type": group.selection_type,
+                "selection_type_display": group.get_selection_type_display(),
+                "is_required": link.effective_is_required,
+                "min_select": link.effective_min_select,
+                "max_select": link.effective_max_select,
+                "free_choices_count": int(getattr(group, "free_choices_count", 0) or 0),
+                "order": link.order,
+                "options": options,
+            }
+        )
+
+    return render(
+        request,
+        template,
+        {
+            "item": item,
+            "ctx": ctx,
+            "addon_groups": prepared_addon_groups,
+        },
+    )
 
 
 # -------------------------
@@ -486,6 +552,343 @@ def menu_items_bulk_delete(request: HttpRequest) -> HttpResponse:
     return redirect("restaurant:menu_items_list")
 
 
+# -------------------------
+# Addon management (custom admin)
+# -------------------------
+
+
+@login_required
+def addon_groups_list(request: HttpRequest) -> HttpResponse:
+    q = (request.GET.get("q") or "").strip()
+    status = (request.GET.get("status") or "").strip()
+
+    groups = AddonGroup.objects.all().order_by("order", "name")
+
+    if q:
+        groups = groups.filter(Q(name__icontains=q) | Q(slug__icontains=q))
+
+    if status == "active":
+        groups = groups.filter(is_active=True)
+    elif status == "inactive":
+        groups = groups.filter(is_active=False)
+
+    return render(
+        request,
+        "admin/addon_groups.html",
+        {
+            "groups": groups,
+            "q": q,
+            "status": status,
+        },
+    )
+
+
+@login_required
+def addon_group_add(request: HttpRequest) -> HttpResponse:
+    if request.method == "POST":
+        form = AddonGroupForm(request.POST)
+        if form.is_valid():
+            obj = form.save()
+            messages.success(request, f"Addon group '{obj.name}' created.")
+            return redirect("restaurant:addon_groups_list")
+    else:
+        form = AddonGroupForm()
+
+    return render(
+        request,
+        "admin/addon_group_form.html",
+        {
+            "form": form,
+            "mode": "add",
+        },
+    )
+
+
+@login_required
+def addon_group_edit(request: HttpRequest, pk: int) -> HttpResponse:
+    obj = get_object_or_404(AddonGroup, pk=pk)
+
+    if request.method == "POST":
+        form = AddonGroupForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save()
+            messages.success(request, f"Addon group '{obj.name}' updated.")
+            return redirect("restaurant:addon_groups_list")
+    else:
+        form = AddonGroupForm(instance=obj)
+
+    return render(
+        request,
+        "admin/addon_group_form.html",
+        {
+            "form": form,
+            "mode": "edit",
+            "obj": obj,
+        },
+    )
+
+
+@login_required
+def addon_group_delete(request: HttpRequest, pk: int) -> HttpResponse:
+    obj = get_object_or_404(AddonGroup, pk=pk)
+    linked_items_count = obj.menu_item_links.count()
+    options_count = obj.options.count()
+
+    if request.method == "POST":
+        name = obj.name
+        obj.delete()
+        messages.success(request, f"Addon group '{name}' deleted.")
+        return redirect("restaurant:addon_groups_list")
+
+    return render(
+        request,
+        "admin/addon_group_delete.html",
+        {
+            "obj": obj,
+            "linked_items_count": linked_items_count,
+            "options_count": options_count,
+        },
+    )
+
+
+@login_required
+def addon_options_list(request: HttpRequest) -> HttpResponse:
+    q = (request.GET.get("q") or "").strip()
+    group_id = (request.GET.get("group") or "").strip()
+    status = (request.GET.get("status") or "").strip()
+
+    options = AddonOption.objects.select_related("group").all().order_by(
+        "group__order", "group__name", "order", "name"
+    )
+
+    if q:
+        options = options.filter(
+            Q(name__icontains=q) | Q(group__name__icontains=q)
+        )
+
+    if group_id.isdigit():
+        options = options.filter(group_id=int(group_id))
+
+    if status == "active":
+        options = options.filter(is_active=True)
+    elif status == "inactive":
+        options = options.filter(is_active=False)
+
+    groups = AddonGroup.objects.all().order_by("order", "name")
+
+    return render(
+        request,
+        "admin/addon_options.html",
+        {
+            "options": options,
+            "groups": groups,
+            "q": q,
+            "group_id": group_id,
+            "status": status,
+        },
+    )
+
+
+@login_required
+def addon_option_add(request: HttpRequest) -> HttpResponse:
+    initial = {}
+    group_id = (request.GET.get("group") or "").strip()
+    if group_id.isdigit():
+        initial["group"] = int(group_id)
+
+    if request.method == "POST":
+        form = AddonOptionForm(request.POST)
+        if form.is_valid():
+            obj = form.save()
+            messages.success(request, f"Addon option '{obj.name}' created.")
+            return redirect("restaurant:addon_options_list")
+    else:
+        form = AddonOptionForm(initial=initial)
+
+    return render(
+        request,
+        "admin/addon_option_form.html",
+        {
+            "form": form,
+            "mode": "add",
+        },
+    )
+
+
+@login_required
+def addon_option_edit(request: HttpRequest, pk: int) -> HttpResponse:
+    obj = get_object_or_404(AddonOption, pk=pk)
+
+    if request.method == "POST":
+        form = AddonOptionForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save()
+            messages.success(request, f"Addon option '{obj.name}' updated.")
+            return redirect("restaurant:addon_options_list")
+    else:
+        form = AddonOptionForm(instance=obj)
+
+    return render(
+        request,
+        "admin/addon_option_form.html",
+        {
+            "form": form,
+            "mode": "edit",
+            "obj": obj,
+        },
+    )
+
+
+@login_required
+def addon_option_delete(request: HttpRequest, pk: int) -> HttpResponse:
+    obj = get_object_or_404(AddonOption.objects.select_related("group"), pk=pk)
+
+    if request.method == "POST":
+        name = obj.name
+        obj.delete()
+        messages.success(request, f"Addon option '{name}' deleted.")
+        return redirect("restaurant:addon_options_list")
+
+    return render(
+        request,
+        "admin/addon_option_delete.html",
+        {
+            "obj": obj,
+        },
+    )
+
+
+@login_required
+def menu_item_addon_links_list(request: HttpRequest) -> HttpResponse:
+    q = (request.GET.get("q") or "").strip()
+    item_id = (request.GET.get("item") or "").strip()
+    group_id = (request.GET.get("group") or "").strip()
+
+    links = (
+        MenuItemAddonGroup.objects.select_related("menu_item", "menu_item__category", "addon_group")
+        .all()
+        .order_by("menu_item__category__order", "menu_item__category__name", "menu_item__name", "order", "id")
+    )
+
+    if q:
+        links = links.filter(
+            Q(menu_item__name__icontains=q)
+            | Q(addon_group__name__icontains=q)
+            | Q(menu_item__category__name__icontains=q)
+        )
+
+    if item_id.isdigit():
+        links = links.filter(menu_item_id=int(item_id))
+
+    if group_id.isdigit():
+        links = links.filter(addon_group_id=int(group_id))
+
+    menu_items = (
+        MenuItem.objects.exclude(status=MenuItem.STATUS_HIDDEN)
+        .select_related("category")
+        .order_by("category__order", "category__name", "name")
+    )
+    groups = AddonGroup.objects.all().order_by("order", "name")
+
+    return render(
+        request,
+        "admin/menu_item_addon_links.html",
+        {
+            "links": links,
+            "menu_items": menu_items,
+            "groups": groups,
+            "q": q,
+            "item_id": item_id,
+            "group_id": group_id,
+        },
+    )
+
+
+@login_required
+def menu_item_addon_link_add(request: HttpRequest) -> HttpResponse:
+    initial = {}
+    item_id = (request.GET.get("item") or "").strip()
+    if item_id.isdigit():
+        initial["menu_item"] = int(item_id)
+
+    if request.method == "POST":
+        form = MenuItemAddonGroupForm(request.POST)
+        if form.is_valid():
+            obj = form.save()
+            messages.success(
+                request,
+                f"Addon group '{obj.addon_group.name}' assigned to '{obj.menu_item.name}'.",
+            )
+            return redirect("restaurant:menu_item_addon_links_list")
+    else:
+        form = MenuItemAddonGroupForm(initial=initial)
+
+    return render(
+        request,
+        "admin/menu_item_addon_link_form.html",
+        {
+            "form": form,
+            "mode": "add",
+        },
+    )
+
+
+@login_required
+def menu_item_addon_link_edit(request: HttpRequest, pk: int) -> HttpResponse:
+    obj = get_object_or_404(
+        MenuItemAddonGroup.objects.select_related("menu_item", "addon_group"),
+        pk=pk,
+    )
+
+    if request.method == "POST":
+        form = MenuItemAddonGroupForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save()
+            messages.success(
+                request,
+                f"Addon assignment updated for '{obj.menu_item.name}'.",
+            )
+            return redirect("restaurant:menu_item_addon_links_list")
+    else:
+        form = MenuItemAddonGroupForm(instance=obj)
+
+    return render(
+        request,
+        "admin/menu_item_addon_link_form.html",
+        {
+            "form": form,
+            "mode": "edit",
+            "obj": obj,
+        },
+    )
+
+
+@login_required
+def menu_item_addon_link_delete(request: HttpRequest, pk: int) -> HttpResponse:
+    obj = get_object_or_404(
+        MenuItemAddonGroup.objects.select_related("menu_item", "addon_group"),
+        pk=pk,
+    )
+
+    if request.method == "POST":
+        menu_name = obj.menu_item.name
+        group_name = obj.addon_group.name
+        obj.delete()
+        messages.success(
+            request,
+            f"Removed addon group '{group_name}' from '{menu_name}'.",
+        )
+        return redirect("restaurant:menu_item_addon_links_list")
+
+    return render(
+        request,
+        "admin/menu_item_addon_link_delete.html",
+        {
+            "obj": obj,
+        },
+    )
+
+
 @login_required
 def reservations_list(request: HttpRequest) -> HttpResponse:
     q = (request.GET.get("q") or "").strip()
@@ -704,6 +1107,96 @@ def reservation(request: HttpRequest) -> HttpResponse:
             "reservation_obj": reservation_obj,
         },
     )
+    
+    
+    
+
+# -------------------------
+# Telegram delivery order controls
+# -------------------------
+
+def _allowed_delivery_status_targets(current_status: str) -> set[str]:
+    current_status = str(current_status or "").strip()
+
+    mapping = {
+        DeliveryOrder.STATUS_PENDING: {
+            DeliveryOrder.STATUS_ACCEPTED,
+            DeliveryOrder.STATUS_CANCELLED,
+        },
+        DeliveryOrder.STATUS_ACCEPTED: {
+            DeliveryOrder.STATUS_PREPARING,
+        },
+        DeliveryOrder.STATUS_PREPARING: {
+            DeliveryOrder.STATUS_OUT_FOR_DELIVERY,
+        },
+        DeliveryOrder.STATUS_OUT_FOR_DELIVERY: {
+            DeliveryOrder.STATUS_DELIVERED,
+        },
+        DeliveryOrder.STATUS_DELIVERED: set(),
+        DeliveryOrder.STATUS_CANCELLED: set(),
+    }
+    return mapping.get(current_status, set())
+
+
+def _telegram_status_change_is_valid(current_status: str, target_status: str) -> bool:
+    return target_status in _allowed_delivery_status_targets(current_status)
+
+
+def send_delivery_status_email(order: DeliveryOrder) -> None:
+    """
+    Send status update email to the customer.
+    Safe helper: never breaks existing order flow.
+    """
+    try:
+        if not order:
+            return
+
+        recipient = ""
+        if getattr(order, "user", None) and getattr(order.user, "email", ""):
+            recipient = order.user.email.strip()
+
+        if not recipient:
+            return
+
+        status_label = order.get_status_display()
+        estimated_time = ""
+
+        if order.status == DeliveryOrder.STATUS_ACCEPTED:
+            estimated_time = "Estimated time: 45–60 minutes."
+        elif order.status == DeliveryOrder.STATUS_PREPARING:
+            estimated_time = "Estimated time: 30–45 minutes."
+        elif order.status == DeliveryOrder.STATUS_OUT_FOR_DELIVERY:
+            estimated_time = "Estimated time: 10–20 minutes."
+        elif order.status == DeliveryOrder.STATUS_DELIVERED:
+            estimated_time = "Your food has been delivered."
+        elif order.status == DeliveryOrder.STATUS_CANCELLED:
+            estimated_time = "Your order has been cancelled."
+        else:
+            estimated_time = "We will keep you updated."
+
+        subject = f"Order #{order.id} status updated – {status_label}"
+
+        message = (
+            f"Hello {order.customer_name},\n\n"
+            f"Your order #{order.id} status has been updated.\n\n"
+            f"New status: {status_label}\n"
+            f"{estimated_time}\n\n"
+            f"Delivery address: {order.address_label}\n"
+            f"Order total: € {order.total:.2f}\n\n"
+            f"Thank you for ordering from {settings.RESTAURANT_NAME}."
+        )
+
+        send_mail(
+            subject=subject,
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[recipient],
+            fail_silently=True,
+        )
+
+    except Exception:
+        pass
+
 
 # -------------------------
 # Delivery (location + calc + order + checkout)
@@ -958,112 +1451,389 @@ def _coupon_discount_for_request(
     }
 
 
-# --- Session cart (ONE system only) ---
 
+
+# --- Session cart (ONE system only) ---
+def _normalize_selected_option_ids(raw_ids) -> list[int]:
+    out: list[int] = []
+    seen = set()
+
+    for raw in raw_ids or []:
+        try:
+            oid = int(raw)
+        except Exception:
+            continue
+        if oid <= 0 or oid in seen:
+            continue
+        seen.add(oid)
+        out.append(oid)
+
+    return sorted(out)
+
+
+def _build_cart_line_key(item_id: int, option_ids: list[int]) -> str:
+    if not option_ids:
+        return str(item_id)
+    suffix = "-".join(str(x) for x in sorted(option_ids))
+    return f"{item_id}:{suffix}"
+
+
+def _get_item_addon_links(item: MenuItem):
+    return (
+        MenuItemAddonGroup.objects.filter(
+            menu_item=item,
+            addon_group__is_active=True,
+        )
+        .select_related("addon_group")
+        .prefetch_related("addon_group__options")
+        .order_by("order", "id")
+    )
+
+
+def _validate_selected_addons_for_item(item: MenuItem, raw_option_ids) -> tuple[list[int], list[AddonOption], list[dict]]:
+    """
+    Returns:
+      normalized_ids, selected_options, errors
+    errors format:
+      [{"group_id": 1, "message": "..."}]
+    """
+    option_ids = _normalize_selected_option_ids(raw_option_ids)
+    selected_options = list(
+        AddonOption.objects.select_related("group")
+        .filter(id__in=option_ids, is_active=True, group__is_active=True)
+    )
+    selected_map = {opt.id: opt for opt in selected_options}
+
+    links = list(_get_item_addon_links(item))
+    if not links:
+        # item has no addon groups -> no selected addon is allowed
+        if option_ids:
+            return [], [], [{"group_id": "", "message": "This item does not allow addon selections."}]
+        return [], [], []
+
+    allowed_group_ids = {link.addon_group_id for link in links}
+    group_selected: dict[int, list[AddonOption]] = {}
+
+    invalid_option_found = False
+    for oid in option_ids:
+        opt = selected_map.get(oid)
+        if not opt:
+            invalid_option_found = True
+            continue
+        if opt.group_id not in allowed_group_ids:
+            invalid_option_found = True
+            continue
+        group_selected.setdefault(opt.group_id, []).append(opt)
+
+    errors: list[dict] = []
+
+    if invalid_option_found:
+        errors.append({"group_id": "", "message": "Invalid addon selection."})
+
+    for link in links:
+        group = link.addon_group
+        chosen = group_selected.get(group.id, [])
+
+        min_select = link.effective_min_select
+        max_select = link.effective_max_select
+        is_required = link.effective_is_required
+
+        if is_required and len(chosen) == 0:
+            errors.append({
+                "group_id": group.id,
+                "message": "Please choose at least one option.",
+            })
+            continue
+
+        if len(chosen) < min_select:
+            errors.append({
+                "group_id": group.id,
+                "message": f"Please select at least {min_select} option(s).",
+            })
+
+        if max_select is not None and len(chosen) > max_select:
+            errors.append({
+                "group_id": group.id,
+                "message": f"Please select no more than {max_select} option(s).",
+            })
+
+        if group.selection_type == AddonGroup.SELECTION_SINGLE and len(chosen) > 1:
+            errors.append({
+                "group_id": group.id,
+                "message": "Please choose only one option.",
+            })
+
+    normalized_valid_ids = sorted(
+        opt.id for opts in group_selected.values() for opt in opts
+    )
+
+    valid_selected_options = []
+    seen = set()
+    for oid in normalized_valid_ids:
+        opt = selected_map.get(oid)
+        if opt and opt.id not in seen:
+            seen.add(opt.id)
+            valid_selected_options.append(opt)
+
+    return normalized_valid_ids, valid_selected_options, errors
+
+
+def _serialize_selected_addons(selected_addons: list[dict]) -> list[dict]:
+    return [
+        {
+            "option_id": row["option"].id,
+            "group_id": row["option"].group_id,
+            "group_name": row["option"].group.name,
+            "option_name": row["option"].name,
+            "price": float(row["charged_price"]),
+            "base_price": float(row["base_price"]),
+            "is_free": bool(row["is_free"]),
+        }
+        for row in selected_addons
+    ]
+
+
+def _build_priced_selected_addons_for_item(item: MenuItem, selected_option_ids: list[int]) -> list[dict]:
+    """
+    Returns selected addons with effective charged price after applying
+    the group's free_choices_count rule.
+
+    Output rows:
+    {
+        "option": AddonOption,
+        "base_price": Decimal,
+        "charged_price": Decimal,
+        "is_free": bool,
+    }
+    """
+    if not selected_option_ids:
+        return []
+
+    selected_options = list(
+        AddonOption.objects.select_related("group")
+        .filter(id__in=selected_option_ids, is_active=True, group__is_active=True)
+        .order_by("group__order", "group__name", "order", "id")
+    )
+    selected_map = {opt.id: opt for opt in selected_options}
+
+    priced_rows: list[dict] = []
+
+    addon_links = list(_get_item_addon_links(item))
+    allowed_group_ids = {link.addon_group_id for link in addon_links}
+
+    group_selected: dict[int, list[AddonOption]] = {}
+    for oid in selected_option_ids:
+        opt = selected_map.get(oid)
+        if not opt:
+            continue
+        if opt.group_id not in allowed_group_ids:
+            continue
+        group_selected.setdefault(opt.group_id, []).append(opt)
+
+    link_map = {link.addon_group_id: link for link in addon_links}
+
+    for group_id, opts in group_selected.items():
+        link = link_map.get(group_id)
+        group = link.addon_group if link else None
+        free_count = int(getattr(group, "free_choices_count", 0) or 0)
+
+        for index, opt in enumerate(opts):
+            base_price = Decimal(str(opt.price or 0))
+            is_free = index < free_count
+            charged_price = Decimal("0.00") if is_free else base_price
+
+            priced_rows.append(
+                {
+                    "option": opt,
+                    "base_price": base_price,
+                    "charged_price": charged_price,
+                    "is_free": is_free,
+                }
+            )
+
+    return priced_rows
+
+def _cart_parse_lines(request: HttpRequest) -> list[dict]:
+    """
+    Parses session cart and returns normalized lines with pricing.
+    """
+    cart = _cart_get(request.session)
+    items_map = cart.get("items", {}) if isinstance(cart, dict) else {}
+
+    line_rows = []
+    item_ids: list[int] = []
+
+    for cart_key, row in items_map.items():
+        if not isinstance(row, dict):
+            continue
+
+        try:
+            item_id = int(row.get("item_id"))
+            qty = int(row.get("qty", 0))
+        except Exception:
+            continue
+
+        if qty <= 0:
+            continue
+
+        selected_option_ids = _normalize_selected_option_ids(row.get("selected_options", []))
+
+        item_ids.append(item_id)
+        line_rows.append(
+            {
+                "key": str(cart_key),
+                "item_id": item_id,
+                "qty": qty,
+                "selected_option_ids": selected_option_ids,
+            }
+        )
+
+    if not line_rows:
+        return []
+
+    menu_items = {
+        m.id: m
+        for m in MenuItem.objects.filter(id__in=item_ids).exclude(status=MenuItem.STATUS_HIDDEN)
+    }
+
+    all_option_ids = sorted({
+        oid
+        for row in line_rows
+        for oid in row["selected_option_ids"]
+    })
+
+    options_map = {
+        opt.id: opt
+        for opt in AddonOption.objects.select_related("group")
+        .filter(id__in=all_option_ids, is_active=True, group__is_active=True)
+    }
+
+    parsed_lines = []
+
+    for row in line_rows:
+        item = menu_items.get(row["item_id"])
+        if not item:
+            continue
+
+        priced_selected_addons = _build_priced_selected_addons_for_item(
+            item,
+            row["selected_option_ids"],
+        )
+
+        addons_total = sum(
+            (addon["charged_price"] for addon in priced_selected_addons),
+            Decimal("0.00"),
+        )
+
+        base_price = Decimal(str(item.price or 0))
+        unit_price = base_price + addons_total
+        qty = int(row["qty"])
+        line_total = unit_price * Decimal(qty)
+
+        parsed_lines.append(
+            {
+                "key": row["key"],
+                "id": item.id,
+                "name": item.name,
+                "qty": qty,
+                "base_price": round(float(base_price), 2),
+                "addons_total": round(float(addons_total), 2),
+                "unit_price": round(float(unit_price), 2),
+                "line_total": round(float(line_total), 2),
+                "addons": _serialize_selected_addons(priced_selected_addons),
+            }
+        )
+
+    return parsed_lines
 
 def _cart_get(session) -> dict:
     """
     Cart stored in session as:
     {
-      "items": { "12": {"qty": 2}, "5": {"qty": 1} },
+      "items": {
+        "12": {
+          "item_id": 12,
+          "qty": 2,
+          "selected_options": []
+        },
+        "12:4-8": {
+          "item_id": 12,
+          "qty": 1,
+          "selected_options": [4, 8]
+        }
+      }
     }
+
+    Also auto-upgrades old cart structure:
+    { "items": { "12": {"qty": 2} } }
     """
     cart = session.get("delivery_cart")
     if not isinstance(cart, dict):
         cart = {"items": {}}
         session["delivery_cart"] = cart
+
     if "items" not in cart or not isinstance(cart["items"], dict):
         cart["items"] = {}
         session["delivery_cart"] = cart
-    return cart
 
+    upgraded = False
+    new_items = {}
 
-def _cart_subtotal(request: HttpRequest) -> float:
-    """Subtotal using the ONE cart structure."""
-    cart = _cart_get(request.session)
-    items_map = cart.get("items", {}) if isinstance(cart, dict) else {}
+    for k, v in cart["items"].items():
+        if not isinstance(v, dict):
+            continue
 
-    ids: list[int] = []
-    qty_map: dict[int, int] = {}
-
-    for k, v in items_map.items():
         try:
-            mid = int(k)
-            qty = int((v or {}).get("qty", 0))
+            item_id = int(v.get("item_id", k))
+            qty = int(v.get("qty", 0))
         except Exception:
             continue
+
         if qty <= 0:
             continue
-        ids.append(mid)
-        qty_map[mid] = qty
 
-    if not ids:
-        return 0.0
+        selected_options = _normalize_selected_option_ids(v.get("selected_options", []))
+        line_key = _build_cart_line_key(item_id, selected_options)
 
-    qs = MenuItem.objects.filter(id__in=ids).exclude(status=MenuItem.STATUS_HIDDEN)
-    subtotal = 0.0
-    for mi in qs:
-        subtotal += float(mi.price) * float(qty_map.get(mi.id, 0))
-    return float(subtotal)
+        new_items[line_key] = {
+            "item_id": item_id,
+            "qty": qty,
+            "selected_options": selected_options,
+        }
+
+        if str(k) != line_key or "item_id" not in v or "selected_options" not in v:
+            upgraded = True
+
+    if upgraded or new_items != cart["items"]:
+        cart["items"] = new_items
+        session["delivery_cart"] = cart
+        session.modified = True
+
+    return cart
+
+def _cart_subtotal(request: HttpRequest) -> float:
+    parsed_lines = _cart_parse_lines(request)
+    subtotal = sum(float(line["line_total"]) for line in parsed_lines)
+    return round(float(subtotal), 2)
 
 
 def _cart_totals(request: HttpRequest) -> dict:
     """
-    Computes totals using MenuItem prices.
+    Computes totals using MenuItem base prices + selected addon prices.
     Returns dict: subtotal, delivery_fee, total, count, lines[]
     """
-    cart = _cart_get(request.session)
-    items_map = cart.get("items", {})
-    ids: list[int] = []
-    qty_map: dict[int, int] = {}
+    parsed_lines = _cart_parse_lines(request)
 
-    for k, v in items_map.items():
-        try:
-            mid = int(k)
-            qty = int((v or {}).get("qty", 0))
-        except Exception:
-            continue
-        if qty <= 0:
-            continue
-        ids.append(mid)
-        qty_map[mid] = qty
-
-    qs = MenuItem.objects.filter(id__in=ids).exclude(status=MenuItem.STATUS_HIDDEN)
-    price_map = {m.id: float(m.price) for m in qs}
-
-    lines = []
-    subtotal = 0.0
-    count = 0
-
-    # keep stable order (ids order)
-    for mid in ids:
-        if mid not in price_map:
-            continue
-        qty = qty_map.get(mid, 0)
-        price = price_map[mid]
-        line_total = price * qty
-        subtotal += line_total
-        count += qty
-        mi = next((m for m in qs if m.id == mid), None)
-        lines.append(
-            {
-                "id": mid,
-                "name": mi.name if mi else f"Item {mid}",
-                "qty": qty,
-                "unit_price": round(price, 2),
-                "line_total": round(line_total, 2),
-            }
-        )
-
+    subtotal = sum(float(line["line_total"]) for line in parsed_lines)
+    count = sum(int(line["qty"]) for line in parsed_lines)
     fee = float(request.session.get("delivery_fee", 0) or 0)
 
-    # coupon discount (applies to subtotal only)
+    # coupon discount applies to subtotal only
     discount, coupon_info = _coupon_discount_for_request(request, subtotal)
 
     coupon = _get_coupon_from_session(request)
 
     if coupon and coupon.discount_type == DeliveryCoupon.DISCOUNT_FREE_DELIVERY:
-        # Only free delivery if subtotal meets coupon min
         ok = coupon.grants_free_delivery(Decimal(str(subtotal)))
         if ok:
             fee = 0.0
@@ -1071,8 +1841,6 @@ def _cart_totals(request: HttpRequest) -> dict:
         else:
             coupon_info["free_delivery"] = False
 
-    # If cart empty, force fee/discount zero
-    # If cart empty: force totals zero, BUT keep coupon_info for UI preview
     if count <= 0:
         fee = 0.0
         discount = 0.0
@@ -1102,10 +1870,9 @@ def _cart_totals(request: HttpRequest) -> dict:
         "coupon": coupon_info,
         "total": round(total, 2),
         "count": count,
-        "lines": lines,
-        "delivery_fee_waived": bool(coupon_info.get("free_delivery")),  # ✅ NEW
+        "lines": parsed_lines,
+        "delivery_fee_waived": bool(coupon_info.get("free_delivery")),
     }
-
 
 def delivery_location(request: HttpRequest) -> HttpResponse:
     promo = _active_promo()
@@ -1198,7 +1965,7 @@ def delivery_set_location(request: HttpRequest) -> HttpResponse:
 
 @require_POST
 def delivery_cart_add(request: HttpRequest) -> JsonResponse:
-    """POST: item_id, qty(optional default=1)"""
+    """POST: item_id, qty(optional), selected_options[] (optional)"""
     try:
         item_id = int(request.POST.get("item_id"))
         qty = int(request.POST.get("qty", 1))
@@ -1212,41 +1979,74 @@ def delivery_cart_add(request: HttpRequest) -> JsonResponse:
     if mi.status == MenuItem.STATUS_HIDDEN:
         return JsonResponse({"ok": False, "error": "Item not available"}, status=404)
 
+    raw_selected_options = request.POST.getlist("selected_options")
+    valid_option_ids, selected_options, errors = _validate_selected_addons_for_item(
+        mi,
+        raw_selected_options,
+    )
+
+    if errors:
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Please fix addon selections.",
+                "addon_errors": errors,
+            },
+            status=400,
+        )
+
     cart = _cart_get(request.session)
     items = cart["items"]
-    k = str(item_id)
-    cur = int((items.get(k) or {}).get("qty", 0))
-    items[k] = {"qty": cur + qty}
+
+    line_key = _build_cart_line_key(item_id, valid_option_ids)
+    current_row = items.get(line_key) or {
+        "item_id": item_id,
+        "qty": 0,
+        "selected_options": valid_option_ids,
+    }
+
+    current_qty = int(current_row.get("qty", 0))
+    items[line_key] = {
+        "item_id": item_id,
+        "qty": current_qty + qty,
+        "selected_options": valid_option_ids,
+    }
+
+    request.session["delivery_cart"] = cart
     request.session.modified = True
 
     totals = _cart_totals(request)
     return JsonResponse({"ok": True, "cart": totals})
 
-
 @require_POST
 def delivery_cart_update(request: HttpRequest) -> JsonResponse:
-    """POST: item_id, qty"""
+    """POST: cart_key, qty"""
+    cart_key = (request.POST.get("cart_key") or "").strip()
+
     try:
-        item_id = int(request.POST.get("item_id"))
         qty = int(request.POST.get("qty"))
     except Exception:
         return JsonResponse({"ok": False, "error": "Invalid payload"}, status=400)
 
-    mi = get_object_or_404(MenuItem, id=item_id)
-    if mi.status == MenuItem.STATUS_HIDDEN:
-        return JsonResponse({"ok": False, "error": "Item not available"}, status=404)
+    if not cart_key:
+        return JsonResponse({"ok": False, "error": "Missing cart key"}, status=400)
 
     cart = _cart_get(request.session)
     items = cart["items"]
-    k = str(item_id)
+
+    if cart_key not in items:
+        return JsonResponse({"ok": False, "error": "Cart line not found"}, status=404)
 
     if qty <= 0:
-        if k in items:
-            del items[k]
+        del items[cart_key]
     else:
-        items[k] = {"qty": qty}
+        row = items[cart_key]
+        row["qty"] = qty
+        items[cart_key] = row
 
+    request.session["delivery_cart"] = cart
     request.session.modified = True
+
     totals = _cart_totals(request)
     return JsonResponse({"ok": True, "cart": totals})
 
@@ -1391,6 +2191,7 @@ def delete_promotion(request: HttpRequest, pk: int) -> HttpResponse:
 # -------------------------
 
 
+@ensure_csrf_cookie
 def delivery_checkout(request: HttpRequest) -> HttpResponse:
     # Must have location
     if not request.session.get("delivery_lat") or not request.session.get(
@@ -1425,7 +2226,7 @@ def delivery_checkout(request: HttpRequest) -> HttpResponse:
 
     if placed and order_id.isdigit():
         order_obj = (
-            DeliveryOrder.objects.prefetch_related("items")
+            DeliveryOrder.objects.prefetch_related("items__addon_snapshots")
             .filter(id=int(order_id))
             .first()
         )
@@ -1678,8 +2479,7 @@ def delivery_place_order(request: HttpRequest) -> HttpResponse:
         coupon_discount=coupon_discount,
         payment_method=payment_method,
     )
-
-    # snapshot items (NO menu_item FK in model)
+    # snapshot items + addon snapshots
     ids = [int(x["id"]) for x in lines if str(x.get("id", "")).isdigit()]
     menu_map = {
         m.id: m
@@ -1688,7 +2488,8 @@ def delivery_place_order(request: HttpRequest) -> HttpResponse:
         )
     }
 
-    bulk = []
+    created_order_items = []
+
     for line in lines:
         mid_raw = line.get("id")
         if not str(mid_raw).isdigit():
@@ -1700,19 +2501,33 @@ def delivery_place_order(request: HttpRequest) -> HttpResponse:
             continue
 
         unit_price = Decimal(str(line.get("unit_price") or 0))
+        addons_total = Decimal(str(line.get("addons_total") or 0))
         mi = menu_map.get(mid)
 
-        bulk.append(
-            DeliveryOrderItem(
-                order=order,
-                name=(mi.name if mi else str(line.get("name") or f"Item {mid}")),
-                unit_price=unit_price,
-                qty=qty,
-            )
+        order_item = DeliveryOrderItem.objects.create(
+            order=order,
+            menu_item=mi if mi else None,
+            name=(mi.name if mi else str(line.get("name") or f"Item {mid}")),
+            unit_price=unit_price,
+            addons_total=addons_total,
+            qty=qty,
         )
+        created_order_items.append((order_item, line))
 
-    if bulk:
-        DeliveryOrderItem.objects.bulk_create(bulk)
+    addon_snapshot_bulk = []
+    for order_item, line in created_order_items:
+        for addon in (line.get("addons") or []):
+            addon_snapshot_bulk.append(
+                DeliveryOrderItemAddon(
+                    order_item=order_item,
+                    group_name=str(addon.get("group_name") or ""),
+                    option_name=str(addon.get("option_name") or ""),
+                    option_price=Decimal(str(addon.get("price") or 0)),
+                )
+            )
+
+    if addon_snapshot_bulk:
+        DeliveryOrderItemAddon.objects.bulk_create(addon_snapshot_bulk)
 
     # increment coupon usage (if any) — only if order successfully created
     if coupon:
@@ -1734,38 +2549,50 @@ def delivery_place_order(request: HttpRequest) -> HttpResponse:
     )
     request.session.modified = True
 
-       # --- Telegram notify (safe: never breaks order) ---
+    # --- Telegram notify with inline buttons (safe: never breaks order) ---
     try:
-        from restaurant.telegram_utils import send_telegram_message, maps_link, safe
+        order = DeliveryOrder.objects.prefetch_related("items__addon_snapshots").get(id=order.id)
 
-        items_lines = []
-        for it in order.items.all():
-            items_lines.append(
-                f"• {safe(it.name)} × {it.qty} = € {(it.unit_price * it.qty):.2f}"
+        msg = build_delivery_order_message(order)
+        keyboard = build_delivery_status_keyboard(order.id, order.status)
+
+        tg_result = send_telegram_message_full(
+            text=msg,
+            reply_markup=keyboard,
+        )
+
+        tg_message = (tg_result.get("result") or {})
+        tg_chat = (tg_message.get("chat") or {})
+        tg_message_id = tg_message.get("message_id")
+        tg_chat_id = tg_chat.get("id")
+
+        updates = []
+        if tg_chat_id is not None:
+            order.telegram_chat_id = str(tg_chat_id)
+            updates.append("telegram_chat_id")
+
+        if tg_message_id is not None:
+            order.telegram_message_id = int(tg_message_id)
+            updates.append("telegram_message_id")
+
+        order.telegram_last_status_sent = order.status
+        updates.append("telegram_last_status_sent")
+
+        if updates:
+            order.save(update_fields=updates)
+
+        try:
+            from restaurant.models import TelegramLog
+            TelegramLog.objects.create(
+                ok=True,
+                kind="delivery",
+                chat_id=str(order.telegram_chat_id or ""),
+                message_preview=f"delivery order #{order.id} sent with buttons",
+                response_text=str(tg_result)[:1500],
             )
-        items_text = "\n".join(items_lines) if items_lines else "—"
+        except Exception:
+            pass
 
-        gmaps = maps_link(order.lat, order.lng)
-
-        msg = (
-                f"🛵 NEW DELIVERY ORDER\n\n"
-                f"Order: #{order.id}\n"
-                f"Name: {order.customer_name}\n"
-                f"Phone: {order.customer_phone}\n"
-                f"Payment: {order.get_payment_method_display()}\n"
-                f"Address: {order.address_label}\n"
-                f"Extra: {order.address_extra}\n"
-                f"Distance: {order.distance_km:.2f} km\n"
-                f"Subtotal: € {order.subtotal:.2f}\n"
-                f"Delivery fee: € {order.delivery_fee:.2f}\n"
-                f"Total: € {order.total:.2f}\n"
-                f"Coupon: {order.coupon_code or '-'} (-€ {order.coupon_discount:.2f})\n"
-                f"Note: {order.customer_note or '-'}\n\n"
-                f"Items:\n{items_text}\n\n"
-                f"Map: {gmaps}"
-            )
-
-        send_telegram_message(msg, kind="delivery")
     except Exception as e:
         try:
             from restaurant.models import TelegramLog
@@ -1806,7 +2633,12 @@ def delivery_orders_bulk_update(request: HttpRequest) -> HttpResponse:
         messages.error(request, "No orders selected.")
         return redirect("restaurant:delivery_orders_list")
 
+    orders_to_update = list(DeliveryOrder.objects.filter(id__in=ids_int))
     updated = DeliveryOrder.objects.filter(id__in=ids_int).update(status=new_status)
+
+    for order in orders_to_update:
+        order.status = new_status
+        send_delivery_status_email(order)
 
     # ✅ Loyalty: if bulk set to delivered, ensure coupons for affected users
     if new_status == DeliveryOrder.STATUS_DELIVERED:
@@ -1835,6 +2667,31 @@ def delivery_orders_bulk_update(request: HttpRequest) -> HttpResponse:
 
     messages.success(request, f"Updated {updated} order(s).")
     return redirect("restaurant:delivery_orders_list")
+
+@require_POST
+@login_required
+def customer_mark_order_received(request: HttpRequest, order_id: int) -> HttpResponse:
+    """
+    Customer confirms the order is received.
+    Only allowed if:
+    - order belongs to logged-in user
+    - status is out_for_delivery
+    """
+    o = get_object_or_404(DeliveryOrder, id=order_id, user=request.user)
+
+    if o.status != DeliveryOrder.STATUS_OUT_FOR_DELIVERY:
+        messages.error(request, _("This order cannot be marked as received right now."))
+        return redirect("accounts:my_orders")  # ✅ change if your url name is different
+
+    o.status = DeliveryOrder.STATUS_DELIVERED
+    o.save(update_fields=["status"])
+    send_delivery_status_email(o)
+
+    # loyalty coupon logic stays consistent
+    _ensure_loyalty_coupon_for_user(request.user)
+
+    messages.success(request, _("Thanks! Your order is marked as delivered."))
+    return redirect("accounts:my_orders")  # ✅ change if needed
 
 
 @require_POST
@@ -1886,9 +2743,11 @@ def delivery_orders_list(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def delivery_order_detail_admin(request: HttpRequest, pk: int) -> HttpResponse:
-    o = get_object_or_404(DeliveryOrder.objects.prefetch_related("items"), pk=pk)
+    o = get_object_or_404(
+        DeliveryOrder.objects.prefetch_related("items__addon_snapshots"),
+        pk=pk,
+    )
     return render(request, "admin/delivery_order_detail.html", {"o": o})
-
 
 @login_required
 def delivery_order_update_status(request: HttpRequest, pk: int) -> HttpResponse:
@@ -1901,6 +2760,7 @@ def delivery_order_update_status(request: HttpRequest, pk: int) -> HttpResponse:
         if new_status in valid:
             o.status = new_status
             o.save(update_fields=["status"])
+            send_delivery_status_email(o)
             messages.success(request, "Order status updated.")
 
             # ✅ Loyalty: when order becomes delivered, grant coupon if eligible
@@ -2074,6 +2934,48 @@ def loyalty_settings(request):
 
 
 
+@login_required
+def delivery_pricing_settings(request):
+    obj = DeliveryPricing.objects.order_by("-updated_at").first()
+
+    if request.method == "POST":
+        # read inputs safely
+        is_active = bool(request.POST.get("is_active"))
+
+        def to_dec(name, default):
+            v = (request.POST.get(name) or "").strip()
+            try:
+                return Decimal(v)
+            except Exception:
+                return Decimal(default)
+
+        base_km = to_dec("base_km", "2.00")
+        base_fee = to_dec("base_fee", "1.99")
+        per_km_fee = to_dec("per_km_fee", "0.99")
+        max_fee = to_dec("max_fee", "8.99")
+
+        if not obj:
+            obj = DeliveryPricing.objects.create(
+                is_active=is_active,
+                base_km=base_km,
+                base_fee=base_fee,
+                per_km_fee=per_km_fee,
+                max_fee=max_fee,
+            )
+        else:
+            obj.is_active = is_active
+            obj.base_km = base_km
+            obj.base_fee = base_fee
+            obj.per_km_fee = per_km_fee
+            obj.max_fee = max_fee
+            obj.save()
+
+        messages.success(request, "Delivery pricing updated.")
+        return redirect("restaurant:delivery_pricing_settings")
+
+    return render(request, "admin/delivery_pricing_settings.html", {"obj": obj})
+
+
 def reviews_page(request):
     # --------------------------
     # 1️⃣ Handle POST (SAVE REVIEW)
@@ -2148,3 +3050,215 @@ def delivery_location_partial(request: HttpRequest) -> HttpResponse:
         "promo_free_delivery": bool(promo.free_delivery) if promo else False,
     }
     return render(request, "partials/delivery_location_modal.html", ctx)
+
+
+
+@csrf_exempt
+@require_POST
+def telegram_webhook(request: HttpRequest) -> JsonResponse:
+    """
+    Telegram webhook endpoint.
+    Handles inline button callback queries for delivery order status updates.
+    """
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"ok": False, "error": "invalid json"}, status=400)
+
+    callback_query = payload.get("callback_query") or {}
+    if not callback_query:
+        return JsonResponse({"ok": True})
+
+    callback_id = str(callback_query.get("id") or "").strip()
+    from_user = callback_query.get("from") or {}
+    tg_user_id = from_user.get("id")
+    tg_name = (
+        from_user.get("username")
+        or " ".join(
+            x for x in [
+                str(from_user.get("first_name") or "").strip(),
+                str(from_user.get("last_name") or "").strip(),
+            ] if x
+        )
+        or str(tg_user_id or "")
+    )
+
+    if not telegram_user_is_allowed(tg_user_id):
+        try:
+            answer_callback_query(
+                callback_id,
+                "You are not allowed to manage orders.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    data = str(callback_query.get("data") or "").strip()
+    parts = data.split(":")
+
+    if len(parts) != 3 or parts[0] != "do":
+        try:
+            answer_callback_query(
+                callback_id,
+                "Invalid action.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    _, raw_order_id, target_status = parts
+
+    if not str(raw_order_id).isdigit():
+        try:
+            answer_callback_query(
+                callback_id,
+                "Invalid order id.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    valid_statuses = {k for k, _ in DeliveryOrder.STATUS_CHOICES}
+    if target_status not in valid_statuses:
+        try:
+            answer_callback_query(
+                callback_id,
+                "Invalid status.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    order = (
+        DeliveryOrder.objects
+        .prefetch_related("items__addon_snapshots")
+        .filter(id=int(raw_order_id))
+        .first()
+    )
+
+    if not order:
+        try:
+            answer_callback_query(
+                callback_id,
+                "Order not found.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    current_status = str(order.status or "").strip()
+
+    if current_status == target_status:
+        try:
+            answer_callback_query(
+                callback_id,
+                f"Order already {delivery_status_label(current_status)}.",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    if not _telegram_status_change_is_valid(current_status, target_status):
+        try:
+            answer_callback_query(
+                callback_id,
+                f"Invalid transition: {delivery_status_label(current_status)} → {delivery_status_label(target_status)}",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return JsonResponse({"ok": True})
+
+    order.status = target_status
+    order.telegram_last_action_by = str(tg_name)[:120]
+    order.telegram_last_action_at = timezone.now()
+    order.telegram_last_status_sent = target_status
+    order.save(
+        update_fields=[
+            "status",
+            "telegram_last_action_by",
+            "telegram_last_action_at",
+            "telegram_last_status_sent",
+        ]
+    )
+    send_delivery_status_email(order)
+
+    if target_status == DeliveryOrder.STATUS_DELIVERED and order.user:
+        try:
+            _ensure_loyalty_coupon_for_user(order.user)
+        except Exception:
+            pass
+
+    message_text = build_delivery_order_message(order)
+    keyboard = build_delivery_status_keyboard(order.id, order.status)
+
+    chat_id = str(order.telegram_chat_id or "").strip()
+    message_id = order.telegram_message_id
+
+    try:
+        if chat_id and message_id:
+            edit_telegram_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=message_text,
+                reply_markup=keyboard,
+            )
+    except Exception:
+        pass
+
+    try:
+        answer_callback_query(
+            callback_id,
+            f"Order #{order.id} updated to {delivery_status_label(order.status)}",
+            show_alert=False,
+        )
+    except Exception:
+        pass
+
+    try:
+        TelegramLog.objects.create(
+            ok=True,
+            kind="delivery_status_telegram",
+            chat_id=chat_id,
+            message_preview=f"Order #{order.id} -> {order.status} by {tg_name}",
+            response_text="telegram callback handled",
+        )
+    except Exception:
+        pass
+
+    return JsonResponse({"ok": True})
+
+
+
+@login_required
+@require_GET
+def customer_orders_status_api(request: HttpRequest) -> JsonResponse:
+    orders = (
+        DeliveryOrder.objects
+        .filter(user=request.user)
+        .order_by("-created_at")
+        .values("id", "status")
+    )
+
+    status_map = dict(DeliveryOrder.STATUS_CHOICES)
+
+    payload = [
+        {
+            "id": row["id"],
+            "status": row["status"],
+            "status_display": status_map.get(row["status"], row["status"]),
+        }
+        for row in orders
+    ]
+
+    return JsonResponse({
+        "ok": True,
+        "orders": payload,
+    })
