@@ -6,54 +6,197 @@
 <section class="bg-[#f5f0e6]">
   <div class="max-w-6xl mx-auto px-4 py-10">
 
-    <div class="flex items-center justify-between mb-6">
-      <div>
-        <h1 class="text-3xl font-semibold text-[#3e2723]">My Orders</h1>
-        <p class="text-sm text-[#3e2723]/70 mt-1">All your online delivery orders</p>
+    <!-- Header -->
+    <div class="relative overflow-hidden rounded-3xl border border-[#3e2723]/10 bg-white/70 shadow-sm mb-6">
+      <div class="absolute -top-24 -right-24 h-64 w-64 rounded-full bg-[#bfa76f]/20 blur-3xl"></div>
+      <div class="absolute -bottom-28 -left-28 h-72 w-72 rounded-full bg-[#3e2723]/10 blur-3xl"></div>
+
+      <div class="relative p-6 sm:p-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+          <div class="text-xs uppercase tracking-[0.35em] text-[#3e2723]/55">My Orders</div>
+          <h1 class="mt-2 text-3xl md:text-4xl font-semibold text-[#3e2723]">My Orders</h1>
+          <p class="text-sm text-[#3e2723]/70 mt-2">All your online delivery orders</p>
+        </div>
+
+        <a href="{% url 'accounts:dashboard' %}"
+           class="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-white border border-[#3e2723]/10 text-[#3e2723]
+                  shadow-sm hover:bg-[#fff7ea] active:scale-[0.99] transition">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+          </svg>
+          Back
+        </a>
       </div>
-      <a href="{% url 'accounts:dashboard' %}" class="underline text-[#3e2723]/70 hover:text-[#3e2723]">Back</a>
     </div>
 
     {% if orders %}
       <div class="space-y-4">
         {% for o in orders %}
-          <div class="rounded-2xl bg-white border border-[#3e2723]/10 p-6 shadow-sm">
-            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
-              <div class="font-semibold text-[#3e2723]">Order #{{ o.id }}</div>
-              <div class="text-sm text-[#3e2723]/70">{{ o.created_at|date:"M d, Y H:i" }}</div>
-            </div>
+          <div class="group rounded-3xl bg-white/80 border border-[#3e2723]/10 shadow-sm overflow-hidden hover:shadow-md transition">
+            <!-- Top bar -->
+            <div class="p-6 sm:p-7 border-b border-[#3e2723]/10">
+              <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                <div class="min-w-0">
+                  <div class="flex items-center gap-3">
+                    <div class="font-semibold text-[#3e2723] text-lg">Order #{{ o.id }}</div>
+                    <span id="order-badge-{{ o.id }}"
+                          data-order-id="{{ o.id }}"
+                          data-order-status="{{ o.status }}"
+                          class="inline-flex items-center rounded-full border border-[#3e2723]/10 bg-[#3e2723]/5 px-2.5 py-1 text-xs font-semibold text-[#3e2723]">
+                      {{ o.get_status_display }}
+                    </span>
+                  </div>
+                  <div class="mt-1 text-sm text-[#3e2723]/70">
+                    {{ o.created_at|date:"M d, Y H:i" }}
+                  </div>
+                </div>
 
-            <div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
-              <div class="text-[#3e2723]/70">Status: <span class="font-semibold text-[#3e2723]">{{ o.get_status_display }}</span></div>
-              <div class="text-[#3e2723]/70">Payment: <span class="font-semibold text-[#3e2723]">{{ o.get_payment_method_display }}</span></div>
-              <div class="text-[#3e2723]/70">Total: <span class="font-semibold text-[#3e2723]">€ {{ o.total|floatformat:2 }}</span></div>
+                <div class="shrink-0 flex items-center gap-3">
+                  <div class="text-right">
+                    <div class="text-[11px] uppercase tracking-wider text-[#3e2723]/55">Total</div>
+                    <div class="text-lg font-semibold text-[#3e2723]">€ {{ o.total|floatformat:2 }}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-sm">
+                <div class="rounded-2xl border border-[#3e2723]/10 bg-white p-4">
+                  <div class="text-[11px] uppercase tracking-wider text-[#3e2723]/55">Status</div>
+                  <div id="order-status-text-{{ o.id }}"
+                  data-order-id="{{ o.id }}"
+                  data-order-status="{{ o.status }}"
+                  class="mt-1 font-semibold text-[#3e2723]">{{ o.get_status_display }}</div>
+                </div>
+
+                <div class="rounded-2xl border border-[#3e2723]/10 bg-white p-4">
+                  <div class="text-[11px] uppercase tracking-wider text-[#3e2723]/55">Payment</div>
+                  <div class="mt-1 font-semibold text-[#3e2723]">{{ o.get_payment_method_display }}</div>
+                </div>
+
+                <div class="rounded-2xl border border-[#bfa76f]/25 bg-[#bfa76f]/10 p-4">
+                  <div class="text-[11px] uppercase tracking-wider text-[#3e2723]/55">Total</div>
+                  <div class="mt-1 font-semibold text-[#3e2723]">€ {{ o.total|floatformat:2 }}</div>
+                </div>
+              </div>
+             
+
+              {% if request.user.is_authenticated and o.user_id == request.user.id %}
+                <div id="order-received-wrap-{{ o.id }}"
+                    class="mt-4 {% if o.status != 'out_for_delivery' %}hidden{% endif %}">
+                  <form method="post"
+                        action="{% url 'restaurant:customer_mark_order_received' o.id %}">
+                    {% csrf_token %}
+                    <button type="submit"
+                      class="inline-flex items-center gap-2 px-5 py-2.5 rounded-2xl 
+                            bg-[#3e2723] text-white font-semibold shadow-sm
+                            hover:brightness-110 active:scale-[0.98] transition">
+                      Mark as Received
+                    </button>
+                  </form>
+                </div>
+              {% endif %}
             </div>
 
             {% if o.items.all %}
-              <div class="mt-4 border-t border-[#3e2723]/10 pt-4">
-                <div class="text-sm font-semibold text-[#3e2723] mb-2">Items</div>
-                <ul class="space-y-1 text-sm text-[#3e2723]/80">
-                  {% for it in o.items.all %}
-                    <li class="flex items-center justify-between">
-                      <span>{{ it.name }} × {{ it.qty }}</span>
-                      <span>€ {{ it.line_total|floatformat:2 }}</span>
-                    </li>
-                  {% endfor %}
-                </ul>
+              <div class="p-6 sm:p-7 bg-white">
+                <div class="flex items-center justify-between mb-3">
+                  <div class="text-sm font-semibold text-[#3e2723]">Items</div>
+                  <div class="text-xs text-[#3e2723]/60">
+                    {{ o.items.all|length }} item{{ o.items.all|length|pluralize }}
+                  </div>
+                </div>
+
+                <div class="rounded-2xl border border-[#3e2723]/10 overflow-hidden">
+                  <ul class="divide-y divide-[#3e2723]/10">
+                    {% for it in o.items.all %}
+                      <li class="px-4 sm:px-5 py-3 flex items-center justify-between text-sm">
+                        <span class="text-[#3e2723]/85">
+                          {{ it.name }} × <span class="font-semibold text-[#3e2723]">{{ it.qty }}</span>
+                        </span>
+                        <span class="font-semibold text-[#3e2723]">€ {{ it.line_total|floatformat:2 }}</span>
+                      </li>
+                    {% endfor %}
+                  </ul>
+                </div>
               </div>
             {% endif %}
+
+            <div class="h-1 w-full bg-gradient-to-r from-transparent via-[#bfa76f]/45 to-transparent"></div>
           </div>
         {% endfor %}
       </div>
+
     {% else %}
-      <div class="rounded-2xl bg-white border border-[#3e2723]/10 p-6 shadow-sm">
-        <p class="text-[#3e2723]/70">No orders found.</p>
-        <a href="{% url 'restaurant:menu' %}" class="inline-block mt-3 px-5 py-2 rounded-sm bg-gold text-dark font-semibold">
-          Order Online
-        </a>
+      <div class="rounded-3xl bg-white/80 border border-[#3e2723]/10 p-7 shadow-sm overflow-hidden">
+        <div class="flex items-start gap-3">
+          <div class="h-10 w-10 rounded-2xl bg-[#3e2723]/5 border border-[#3e2723]/10 flex items-center justify-center shrink-0">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-[#3e2723]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13l-1.5 7h13M7 13l.4-2M10 21a1 1 0 100-2 1 1 0 000 2zm8 0a1 1 0 100-2 1 1 0 000 2z"/>
+            </svg>
+          </div>
+          <div>
+            <p class="text-[#3e2723]/70">No orders found.</p>
+            <a href="{% url 'restaurant:menu' %}"
+               class="inline-flex items-center justify-center mt-4 px-5 py-2.5 rounded-2xl bg-[#bfa76f] text-[#2b1b12] font-semibold shadow-sm
+                      hover:brightness-105 active:scale-[0.99] transition">
+              Order Online
+            </a>
+          </div>
+        </div>
       </div>
     {% endif %}
 
   </div>
 </section>
+{% endblock %}
+
+{% block extra_body %}
+<script>
+(function () {
+  const STATUS_URL = "{% url 'restaurant:customer_orders_status_api' %}";
+  const POLL_INTERVAL = 5000;
+
+  function applyStatusUi(orderId, status, statusDisplay) {
+    const badge = document.getElementById(`order-badge-${orderId}`);
+    const text = document.getElementById(`order-status-text-${orderId}`);
+    const receivedWrap = document.getElementById(`order-received-wrap-${orderId}`);
+
+    if (badge) {
+      badge.textContent = statusDisplay;
+      badge.dataset.orderStatus = status;
+    }
+
+    if (text) {
+      text.textContent = statusDisplay;
+      text.dataset.orderStatus = status;
+    }
+
+    if (receivedWrap) {
+      receivedWrap.classList.toggle("hidden", status !== "out_for_delivery");
+    }
+  }
+
+  async function pollOrderStatuses() {
+    try {
+      const res = await fetch(STATUS_URL, {
+        headers: { "X-Requested-With": "XMLHttpRequest" }
+      });
+
+      if (!res.ok) return;
+
+      const data = await res.json();
+      if (!data || !data.ok || !Array.isArray(data.orders)) return;
+
+      data.orders.forEach((order) => {
+        applyStatusUi(order.id, order.status, order.status_display);
+      });
+    } catch (err) {
+      console.warn("Order status polling failed:", err);
+    }
+  }
+
+  pollOrderStatuses();
+  setInterval(pollOrderStatuses, POLL_INTERVAL);
+})();
+</script>
 {% endblock %}
