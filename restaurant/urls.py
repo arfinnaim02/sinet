@@ -32,6 +32,24 @@ urlpatterns = [
     path("admin/menu/<int:pk>/edit/", views.edit_menu_item, name="edit_menu_item"),
     path("admin/menu/<int:pk>/delete/", views.delete_menu_item, name="delete_menu_item"),
 
+        # Addon groups
+    path("admin/addon-groups/", views.addon_groups_list, name="addon_groups_list"),
+    path("admin/addon-groups/add/", views.addon_group_add, name="addon_group_add"),
+    path("admin/addon-groups/<int:pk>/edit/", views.addon_group_edit, name="addon_group_edit"),
+    path("admin/addon-groups/<int:pk>/delete/", views.addon_group_delete, name="addon_group_delete"),
+
+    # Addon options
+    path("admin/addon-options/", views.addon_options_list, name="addon_options_list"),
+    path("admin/addon-options/add/", views.addon_option_add, name="addon_option_add"),
+    path("admin/addon-options/<int:pk>/edit/", views.addon_option_edit, name="addon_option_edit"),
+    path("admin/addon-options/<int:pk>/delete/", views.addon_option_delete, name="addon_option_delete"),
+
+    # Menu item <-> addon group assignments
+    path("admin/menu-addon-links/", views.menu_item_addon_links_list, name="menu_item_addon_links_list"),
+    path("admin/menu-addon-links/add/", views.menu_item_addon_link_add, name="menu_item_addon_link_add"),
+    path("admin/menu-addon-links/<int:pk>/edit/", views.menu_item_addon_link_edit, name="menu_item_addon_link_edit"),
+    path("admin/menu-addon-links/<int:pk>/delete/", views.menu_item_addon_link_delete, name="menu_item_addon_link_delete"),
+
     # Category management
     path("admin/categories/", views.categories_list, name="categories_list"),
     path("admin/category/add/", views.add_category, name="add_category"),
@@ -99,5 +117,17 @@ urlpatterns = [
     path("admin/menu/bulk-delete/", views.menu_items_bulk_delete, name="menu_items_bulk_delete"),
 
     path("admin/loyalty/", views.loyalty_settings, name="loyalty_settings"),
-    
+    path("admin/delivery-pricing/", views.delivery_pricing_settings, name="delivery_pricing_settings"),
+    path("telegram/webhook/", views.telegram_webhook, name="telegram_webhook"),
+
+    path(
+    "account/orders/<int:order_id>/received/",
+    views.customer_mark_order_received,
+    name="customer_mark_order_received",
+),
+    path(
+    "my-orders/status-api/",
+    views.customer_orders_status_api,
+    name="customer_orders_status_api",
+),
 ]
